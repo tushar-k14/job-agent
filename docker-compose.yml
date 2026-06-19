@@ -1,0 +1,15 @@
+services:
+  job-agent:
+    build: .
+    image: job-application-agent:latest
+    container_name: job-application-agent
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      JOB_AGENT_DB: /app/data/applications.db
+    volumes:
+      # Persist the SQLite DB across container restarts
+      - ./data:/app/data
+    restart: unless-stopped
