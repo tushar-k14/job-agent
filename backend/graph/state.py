@@ -44,5 +44,20 @@ class ApplicationState(TypedDict, total=False):
     application_id: int
     status: str
 
+    # --- Planner / Executor / Verifier bookkeeping (Phase 1) ---
+    # The paste-JD path pre-seeds raw_job_text and sets this so the planner skips fetching.
+    pasted: bool
+    # Current PlannerDecision (as a dict; the planner constructs the Pydantic model).
+    plan: dict
+    # Number of extraction attempts made so far (scrape gate retries).
+    scrape_attempts: int
+    # Number of cover-letter generation attempts so far (judge gate retries).
+    cover_letter_attempts: int
+    # Most recent verifier verdicts (dicts of VerificationResult), for tracing/dashboard.
+    scrape_verdict: dict
+    cover_letter_verdict: dict
+    # Strategy actually used for the successful (or final) extraction.
+    strategy_used: str
+
     # Pipeline bookkeeping
     error: Optional[str]
