@@ -58,6 +58,8 @@ class ApplicationState(TypedDict, total=False):
     cover_letter_verdict: dict
     # Strategy actually used for the successful (or final) extraction.
     strategy_used: str
+    # Fetched HTML cached across retries so we re-parse instead of re-downloading.
+    cached_html: str
 
     # Pipeline bookkeeping
     error: Optional[str]

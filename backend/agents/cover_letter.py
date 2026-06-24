@@ -48,13 +48,37 @@ RESUME:
 \"\"\""""
 
 
+def _feedback_from_verdict(state: ApplicationState) -> str:
+    """Turn the last cover-letter verdict into corrective instructions for a retry."""
+    verdict = state.get("cover_letter_verdict")
+    if not verdict:
+        return ""
+    notes = []
+    if verdict.get("fabrication_detected"):
+        notes.append(
+            "The previous draft contained claims not supported by the resume. Use ONLY "
+            "facts present in the resume; remove any invented skills, metrics, or experience."
+        )
+    if not verdict.get("length_ok", True):
+        notes.append("The previous draft was the wrong length. Keep it to 3 paragraphs, under ~320 words.")
+    if verdict.get("generic_filler"):
+        notes.append("The previous draft was too generic. Replace clichés with specific, resume-grounded details.")
+    if not notes and verdict.get("reason"):
+        notes.append(f"Address this feedback: {verdict['reason']}")
+    if not notes:
+        return ""
+    return "\n\nCORRECTIONS REQUIRED (the prior draft was rejected):\n- " + "\n- ".join(notes)
+
+
 def cover_letter_node(state: ApplicationState) -> dict:
     if state.get("error"):
         return {}
     parsed_job = state.get("parsed_job", {})
     resume = state.get("resume_text", "")
 
-    logger.info("Writing cover letter for: %s", parsed_job.get("title"))
+    attempt = state.get("cover_letter_attempts", 0) + 1
+    feedback = _feedback_from_verdict(state)
+    logger.info("Writing cover letter for %s (attempt %s)", parsed_job.get("title"), attempt)
     try:
         letter = llm_complete(
             _SYSTEM,
@@ -64,11 +88,12 @@ def cover_letter_node(state: ApplicationState) -> dict:
                 transferable=", ".join(state.get("transferable_experiences", []))
                 or "n/a",
                 resume=resume,
-            ),
-            temperature=0.6,
+            )
+            + feedback,
+            temperature=0.6 if attempt == 1 else 0.4,  # tighten on retry
             max_tokens=800,
         )
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Cover letter generation failed: {exc}"}
 
-    return {"cover_letter": letter.strip()}
+    return {"cover_letter": letter.strip(), "cover_letter_attempts": attempt}

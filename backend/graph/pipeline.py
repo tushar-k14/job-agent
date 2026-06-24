@@ -1,20 +1,24 @@
-"""LangGraph state machine wiring the five agents into a pipeline.
+"""LangGraph state machine: planner / executor / verifier agentic loop.
 
-Single-application flow:
-    scraper -> analysis -> tailor -> writer -> tracker -> END
+Flow (Phase 1):
 
-Note: the cover-letter node is registered as "writer" (not "cover_letter") because
-LangGraph forbids using a state key name as a node name.
+    START → planner → executor → scrape_verifier ─(pass)→ analysis → tailor → writer
+                ▲                          │                                      │
+                └──────(retry, capped)─────┘                                      ▼
+                                                                        cover_letter_verifier
+                                                                                  │
+                                              ┌────(pass)→ tracker → END           │
+                                              └────(retry, capped)→ writer ◀───────┘
 
-Each node returns a partial state dict that LangGraph merges. Nodes short-circuit
-their own work when ``state["error"]`` is set, but the tracker still runs so a
-failed run is recorded.
+Two real verification gates with capped retries (N=2 retries ⇒ ≤3 attempts each):
+- scrape_verifier routes back to planner with a failure reason for an alternate
+  extraction strategy until MAX_SCRAPE_ATTEMPTS.
+- cover_letter_verifier routes back to writer to regenerate with corrective
+  instructions until MAX_COVER_LETTER_ATTEMPTS.
 
-Batch mode uses a simple thread-pool map-reduce: each URL is compiled into its own
-isolated run of the same graph, executed concurrently, then results are reduced into
-a list. (LangGraph's `Send`/fan-out API can also express this; a thread pool keeps the
-per-application state fully independent and is the most robust for I/O-bound scraping +
-LLM calls.)
+All hand-offs between nodes are validated through Pydantic models in ``backend.schemas``.
+The paste-JD path is no longer a separate code path: it seeds ``raw_job_text`` + sets
+``pasted=True`` and flows through the same graph (the planner picks PASTE_TEXT).
 """
 
 from __future__ import annotations
@@ -30,39 +34,78 @@ from .state import ApplicationState
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Conditional routers
+# --------------------------------------------------------------------------- #
+def _route_after_scrape(state: ApplicationState) -> str:
+    """After scrape verification: continue, retry via planner, or give up."""
+    from ..agents.verifier import MAX_SCRAPE_ATTEMPTS
+
+    verdict = state.get("scrape_verdict") or {}
+    if verdict.get("passed"):
+        return "analysis"
+    if state.get("scrape_attempts", 0) < MAX_SCRAPE_ATTEMPTS:
+        return "planner"  # retry with an escalated strategy
+    return "tracker"  # exhausted retries — record the failed run
+
+
+def _route_after_cover_letter(state: ApplicationState) -> str:
+    """After cover-letter verification: continue, regenerate, or accept and move on."""
+    from ..agents.verifier import MAX_COVER_LETTER_ATTEMPTS
+
+    verdict = state.get("cover_letter_verdict") or {}
+    if verdict.get("passed"):
+        return "tracker"
+    if state.get("cover_letter_attempts", 0) < MAX_COVER_LETTER_ATTEMPTS:
+        return "writer"  # regenerate with corrective feedback
+    return "tracker"  # exhausted retries — record best effort with the verdict attached
+
+
 def build_graph():
-    """Construct and compile the single-application LangGraph."""
-    # Imported lazily inside the function to avoid a circular import:
-    # agents -> graph.state -> graph package __init__ -> pipeline -> agents.
+    """Construct and compile the planner/executor/verifier LangGraph."""
+    # Lazy imports avoid the agents ↔ graph circular import at module load.
     from ..agents import (
         analysis_node,
         cover_letter_node,
-        scraper_node,
         tailor_node,
         tracker_node,
     )
+    from ..agents.planner import planner_node
+    from ..agents.executor import executor_node
+    from ..agents.verifier import scrape_verifier_node, cover_letter_verifier_node
 
-    graph = StateGraph(ApplicationState)
+    g = StateGraph(ApplicationState)
 
-    graph.add_node("scraper", scraper_node)
-    graph.add_node("analysis", analysis_node)
-    graph.add_node("tailor", tailor_node)
-    graph.add_node("writer", cover_letter_node)
-    graph.add_node("tracker", tracker_node)
+    g.add_node("planner", planner_node)
+    g.add_node("executor", executor_node)
+    g.add_node("scrape_verifier", scrape_verifier_node)
+    g.add_node("analysis", analysis_node)
+    g.add_node("tailor", tailor_node)
+    g.add_node("writer", cover_letter_node)
+    g.add_node("cover_letter_verifier", cover_letter_verifier_node)
+    g.add_node("tracker", tracker_node)
 
-    graph.add_edge(START, "scraper")
-    graph.add_edge("scraper", "analysis")
-    graph.add_edge("analysis", "tailor")
-    graph.add_edge("tailor", "writer")
-    graph.add_edge("writer", "tracker")
-    graph.add_edge("tracker", END)
+    g.add_edge(START, "planner")
+    g.add_edge("planner", "executor")
+    g.add_edge("executor", "scrape_verifier")
+    g.add_conditional_edges(
+        "scrape_verifier",
+        _route_after_scrape,
+        {"analysis": "analysis", "planner": "planner", "tracker": "tracker"},
+    )
+    g.add_edge("analysis", "tailor")
+    g.add_edge("tailor", "writer")
+    g.add_edge("writer", "cover_letter_verifier")
+    g.add_conditional_edges(
+        "cover_letter_verifier",
+        _route_after_cover_letter,
+        {"writer": "writer", "tracker": "tracker"},
+    )
+    g.add_edge("tracker", END)
 
-    return graph.compile()
+    return g.compile()
 
 
-# The compiled graph is stateless and safe to reuse, but we build it lazily on first
-# use to avoid doing work at import time (which would re-enter the agents package
-# before it finishes importing -> circular import).
 _APP_GRAPH = None
 
 
@@ -73,56 +116,31 @@ def get_graph():
     return _APP_GRAPH
 
 
-def run_from_text(job_url: str, raw_jd_text: str, resume_text: str) -> ApplicationState:
-    """Run the pipeline from pasted job description text, skipping the scraper."""
-    from ..agents.scraper import _EXTRACT_SYSTEM, _EXTRACT_USER_TMPL
-    from ..agents import analysis_node, tailor_node, cover_letter_node, tracker_node
-    from ..llm import llm_json, LLMError
-
-    try:
-        parsed = llm_json(
-            _EXTRACT_SYSTEM,
-            _EXTRACT_USER_TMPL.format(text=raw_jd_text[:12000]),
-            temperature=0.1,
-        )
-        parsed = {
-            "title": parsed.get("title") or "Unknown",
-            "company": parsed.get("company") or "Unknown",
-            "required_skills": parsed.get("required_skills") or [],
-            "responsibilities": parsed.get("responsibilities") or [],
-            "nice_to_haves": parsed.get("nice_to_haves") or [],
-            "salary": parsed.get("salary"),
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("JD extraction failed, using empty parsed_job: %s", exc)
-        parsed = {
-            "title": "Unknown", "company": "Unknown",
-            "required_skills": [], "responsibilities": [], "nice_to_haves": [], "salary": None,
-        }
-
-    state: ApplicationState = {
-        "job_url": job_url or "pasted",
-        "resume_text": resume_text,
-        "raw_job_text": raw_jd_text,
-        "parsed_job": parsed,
-        "status": "To Apply",
-    }
-    state.update(analysis_node(state))
-    state.update(tailor_node(state))
-    state.update(cover_letter_node(state))
-    state.update(tracker_node(state))
-    return state
-
-
 def run_single(job_url: str, resume_text: str) -> ApplicationState:
     """Run the full pipeline for one job URL and return the final state."""
     initial: ApplicationState = {
         "job_url": job_url.strip(),
         "resume_text": resume_text,
         "status": "To Apply",
+        "pasted": False,
     }
-    result = get_graph().invoke(initial)
-    return result
+    return get_graph().invoke(initial)
+
+
+def run_from_text(job_url: str, raw_jd_text: str, resume_text: str) -> ApplicationState:
+    """Run the pipeline from pasted job description text.
+
+    No longer a separate orchestration: we seed the raw text and set ``pasted=True`` so
+    the planner selects the PASTE_TEXT strategy and the same graph handles the rest.
+    """
+    initial: ApplicationState = {
+        "job_url": (job_url or "pasted").strip(),
+        "resume_text": resume_text,
+        "raw_job_text": raw_jd_text,
+        "status": "To Apply",
+        "pasted": True,
+    }
+    return get_graph().invoke(initial)
 
 
 def run_batch(
@@ -132,11 +150,7 @@ def run_batch(
     max_workers: int = 4,
     on_complete: Optional[Callable[[int, int, ApplicationState], None]] = None,
 ) -> list[ApplicationState]:
-    """Map-reduce over many URLs in parallel.
-
-    ``on_complete(done_count, total, state)`` is invoked after each finishes, which
-    the Streamlit UI uses to advance a progress bar. Results preserve input order.
-    """
+    """Map-reduce over many URLs in parallel. Results preserve input order."""
     urls = [u.strip() for u in job_urls if u and u.strip()]
     total = len(urls)
     results: list[Optional[ApplicationState]] = [None] * total
