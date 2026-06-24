@@ -1,7 +1,7 @@
-"""Tests for the five agent node functions.
+"""Tests for the agent node functions and extraction strategies.
 
-All LLM calls are mocked; scraper HTTP calls are also mocked. No API keys or
-network access required.
+All LLM calls are mocked; HTTP calls are also mocked. No API keys or network access
+required.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ import pytest
 os.environ.pop("DEEPSEEK_API_KEY", None)
 os.environ.pop("GEMINI_API_KEY", None)
 
-from backend.agents.scraper import scraper_node, fetch_page_text
 from backend.agents.analysis import analysis_node
 from backend.agents.tailor import tailor_node
 from backend.agents.cover_letter import cover_letter_node
@@ -56,12 +55,16 @@ def base_state(parsed_job):
 
 @pytest.fixture(autouse=True)
 def fresh_tracker_db(tmp_path):
-    """Each test that exercises the tracker gets an isolated DB."""
+    """Each test that exercises the tracker gets an isolated DB + memory store."""
     import backend.db.database as dbmod
+    import backend.memory.store as ms
     db_path = str(tmp_path / "test.db")
     dbmod.DB_PATH = db_path
     dbmod.init_db()
+    os.environ["JOB_AGENT_CHROMA_DIR"] = str(tmp_path / "chroma")
+    ms._store = None
     yield
+    ms._store = None
     # Let pytest's tmp_path cleanup handle deletion; Windows locks the file
     # while the sqlite3 module holds it open inside _connect(), so explicit
     # os.remove here would raise PermissionError on Windows.
@@ -69,93 +72,61 @@ def fresh_tracker_db(tmp_path):
 
 # ---- JobScraperAgent --------------------------------------------------------
 
-def _mock_get(html: str):
-    """Patch requests.get used inside fetch_page_text."""
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock()
-    resp.text = html
-    return patch("backend.agents.scraper.requests.get", return_value=resp), resp
+# ---- Extraction strategies (formerly the scraper) ---------------------------
+class TestStrategies:
+    """Behaviors that used to live in scraper.py now live in strategies.py."""
 
-
-class TestScraperNode:
-    _HTML = """<html><body>
-        <h1>Software Engineer</h1>
-        <p>Join Acme Corp. Requirements: Python, SQL. Responsibilities: build APIs.</p>
-        <script>var x = 1;</script>
-    </body></html>"""
-
-    _PARSED = {
-        "title": "Software Engineer",
-        "company": "Acme Corp",
-        "required_skills": ["Python", "SQL"],
-        "responsibilities": ["Build APIs"],
-        "nice_to_haves": [],
-        "salary": None,
-    }
-
-    def test_returns_parsed_job(self):
-        get_patch, _ = _mock_get(self._HTML)
-        with get_patch, patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
-            result = scraper_node({"job_url": "https://example.com/job"})
-        assert result["parsed_job"]["title"] == "Software Engineer"
-        assert result["parsed_job"]["company"] == "Acme Corp"
-        assert "raw_job_text" in result
-        assert "error" not in result
-
-    def test_strips_script_tags_from_raw_text(self):
-        get_patch, _ = _mock_get(self._HTML)
-        with get_patch, patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
-            result = scraper_node({"job_url": "https://example.com/job"})
-        assert "var x" not in result["raw_job_text"]
-
-    def test_http_error_returns_error_field(self):
-        get_patch, resp = _mock_get("")
-        resp.raise_for_status.side_effect = ConnectionError("timeout")
-        with get_patch:
-            result = scraper_node({"job_url": "https://bad.url"})
-        assert "error" in result
-        assert "parsed_job" not in result
-
-    def test_llm_failure_returns_raw_text_and_error(self):
-        from backend.llm import LLMError
-        get_patch, _ = _mock_get(self._HTML)
-        with get_patch, patch("backend.agents.scraper.llm_json", side_effect=LLMError("no keys")):
-            result = scraper_node({"job_url": "https://example.com/job"})
-        assert "error" in result
-        assert "raw_job_text" in result
-
-    def test_normalises_missing_fields(self):
-        get_patch, _ = _mock_get(self._HTML)
-        with get_patch, patch("backend.agents.scraper.llm_json", return_value={"title": None, "company": None}):
-            result = scraper_node({"job_url": "https://example.com/job"})
-        assert result["parsed_job"]["title"] == "Unknown"
-        assert result["parsed_job"]["required_skills"] == []
-
-    def test_blocked_domain_returns_error(self):
-        result = scraper_node({"job_url": "https://www.linkedin.com/jobs/view/123"})
-        assert "error" in result
-        assert "linkedin" in result["error"].lower()
-
-
-class TestFetchPageText:
-    def test_removes_boilerplate_tags(self):
+    def test_generic_text_strips_boilerplate(self):
+        from backend.agents.strategies import text_from_generic
         html = (
             "<html><head><style>body{}</style></head>"
-            "<body><nav>nav</nav><p>real content</p><footer>footer</footer></body></html>"
+            "<body><nav>nav</nav><p>real content</p><footer>footer</footer>"
+            "<script>var x = 1;</script></body></html>"
         )
-        get_patch, _ = _mock_get(html)
-        with get_patch:
-            text = fetch_page_text("https://example.com/job")
+        text = text_from_generic(html)
         assert "real content" in text
-        assert "nav" not in text
-        assert "footer" not in text
+        assert "nav" not in text and "footer" not in text and "var x" not in text
 
-    def test_result_capped_at_12000_chars(self):
-        long_html = "<p>" + "x " * 10000 + "</p>"
-        get_patch, _ = _mock_get(long_html)
-        with get_patch:
-            text = fetch_page_text("https://example.com/job")
+    def test_generic_text_capped(self):
+        from backend.agents.strategies import text_from_generic
+        text = text_from_generic("<p>" + "x " * 10000 + "</p>")
         assert len(text) <= 12000
+
+    def test_selector_prefers_known_container(self):
+        from backend.agents.strategies import text_from_selectors
+        html = (
+            "<html><body><div class='sidebar'>junk junk junk</div>"
+            "<main>" + ("Senior Engineer at Acme. Build and own backend services. " * 8) +
+            "</main></body></html>"
+        )
+        text = text_from_selectors(html)
+        assert "Senior Engineer" in text
+
+    def test_blocked_domain_raises(self):
+        from backend.agents.strategies import check_blocked_domain, BlockedDomainError
+        with pytest.raises(BlockedDomainError):
+            check_blocked_domain("https://www.linkedin.com/jobs/view/123")
+
+    def test_non_blocked_domain_ok(self):
+        from backend.agents.strategies import check_blocked_domain
+        # Should not raise.
+        check_blocked_domain("https://boards.greenhouse.io/acme/jobs/1")
+
+    def test_extract_paste_text_calls_llm(self):
+        from backend.agents import strategies
+        from backend.schemas import ExtractionStrategy
+        with patch.object(strategies, "llm_json", return_value={"title": "Eng", "company": "Acme"}):
+            text, parsed = strategies.extract(ExtractionStrategy.PASTE_TEXT, raw_text="some jd text")
+        assert parsed.title == "Eng"
+        assert text == "some jd text"
+
+    def test_extract_normalises_missing_fields(self):
+        from backend.agents import strategies
+        from backend.schemas import ExtractionStrategy
+        with patch.object(strategies, "llm_json", return_value={"title": None, "company": None}):
+            _, parsed = strategies.extract(ExtractionStrategy.PASTE_TEXT, raw_text="jd")
+        assert parsed.title == "Unknown"
+        assert parsed.required_skills == []
 
 
 # ---- ResumeAnalysisAgent ----------------------------------------------------

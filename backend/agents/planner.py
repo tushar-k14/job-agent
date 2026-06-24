@@ -27,9 +27,21 @@ from ..schemas import ExtractionStrategy, ParsedJob, PlannerDecision
 
 logger = logging.getLogger(__name__)
 
-# Memory hook (Phase 2 will populate this); kept as a no-op seam now so the planner's
-# shape doesn't change when memory lands.
-def _recall_strategy_hint(url: str) -> ExtractionStrategy | None:  # pragma: no cover - seam
+
+def _recall_strategy_hint(url: str) -> ExtractionStrategy | None:
+    """Ask persistent memory whether a strategy has worked for this domain before.
+
+    Returns a known-good strategy to try first, or None to fall back to the default
+    escalation order. Imported lazily so the planner has no hard dependency on Chroma.
+    """
+    try:
+        from ..memory import recall_site_strategy
+
+        name = recall_site_strategy(url)
+        if name:
+            return ExtractionStrategy(name)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Memory recall skipped: %s", exc)
     return None
 
 

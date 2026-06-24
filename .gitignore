@@ -18,6 +18,7 @@ env/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/chroma/
 
 # Streamlit
 .streamlit/secrets.toml

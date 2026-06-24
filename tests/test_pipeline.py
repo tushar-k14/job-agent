@@ -21,10 +21,15 @@ def _apply(patches):
 @pytest.fixture(autouse=True)
 def fresh_db(tmp_path):
     import backend.db.database as dbmod
+    import backend.memory.store as ms
     db_path = str(tmp_path / "pipe.db")
     dbmod.DB_PATH = db_path
     dbmod.init_db()
+    # Isolate Chroma memory per test so tracker's outcome writes don't leak into data/chroma.
+    os.environ["JOB_AGENT_CHROMA_DIR"] = str(tmp_path / "chroma")
+    ms._store = None
     yield
+    ms._store = None
     # Windows SQLite lock: let pytest's tmp_path handle cleanup.
 
 

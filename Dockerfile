@@ -13,9 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
-# Persisted SQLite DB lives here (mount a volume to keep it)
+# Persisted SQLite DB + Chroma vector memory live here (mount a volume to keep them)
 RUN mkdir -p /app/data
-ENV JOB_AGENT_DB=/app/data/applications.db
+ENV JOB_AGENT_DB=/app/data/applications.db \
+    JOB_AGENT_CHROMA_DIR=/app/data/chroma
 
 EXPOSE 8501
 
