@@ -23,13 +23,18 @@ _SYSTEM = (
 
 _USER_TMPL = """Analyze this candidate against the job below.
 
-Return JSON with exactly these keys:
+Return JSON with EXACTLY these four keys — all four are required, use an empty list [] if nothing applies:
 {{
   "match_score": integer,                  // 0-100 overall fit
-  "matching_skills": [string],             // skills the resume clearly demonstrates that the job wants
-  "missing_skills": [string],              // job requirements not evidenced in the resume
-  "transferable_experiences": [string]     // resume experiences that transfer to this role even if not an exact match
+  "matching_skills": [string],             // skills/tools/qualifications the resume clearly demonstrates that the job requires
+  "missing_skills": [string],              // required skills/tools listed in the job that are NOT evidenced anywhere in the resume (never omit this key, even if the list is empty)
+  "transferable_experiences": [string]     // resume experiences that map to this role even if the terminology differs
 }}
+
+Rules:
+- Every required skill from the job must appear in either matching_skills or missing_skills.
+- Do not put the same item in both lists.
+- missing_skills must be present as a key even when the candidate is a strong match.
 
 JOB (structured):
 {job_json}

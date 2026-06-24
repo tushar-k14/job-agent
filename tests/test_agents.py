@@ -69,6 +69,14 @@ def fresh_tracker_db(tmp_path):
 
 # ---- JobScraperAgent --------------------------------------------------------
 
+def _mock_get(html: str):
+    """Patch requests.get used inside fetch_page_text."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.text = html
+    return patch("backend.agents.scraper.requests.get", return_value=resp), resp
+
+
 class TestScraperNode:
     _HTML = """<html><body>
         <h1>Software Engineer</h1>
@@ -85,54 +93,48 @@ class TestScraperNode:
         "salary": None,
     }
 
-    def _mock_get(self):
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.text = self._HTML
-        return patch("backend.agents.scraper.requests.get", return_value=resp)
-
     def test_returns_parsed_job(self):
-        with self._mock_get():
-            with patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
-                result = scraper_node({"job_url": "https://example.com/job"})
+        get_patch, _ = _mock_get(self._HTML)
+        with get_patch, patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
+            result = scraper_node({"job_url": "https://example.com/job"})
         assert result["parsed_job"]["title"] == "Software Engineer"
         assert result["parsed_job"]["company"] == "Acme Corp"
         assert "raw_job_text" in result
         assert "error" not in result
 
     def test_strips_script_tags_from_raw_text(self):
-        with self._mock_get():
-            with patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
-                result = scraper_node({"job_url": "https://example.com/job"})
+        get_patch, _ = _mock_get(self._HTML)
+        with get_patch, patch("backend.agents.scraper.llm_json", return_value=self._PARSED):
+            result = scraper_node({"job_url": "https://example.com/job"})
         assert "var x" not in result["raw_job_text"]
 
     def test_http_error_returns_error_field(self):
-        with patch(
-            "backend.agents.scraper.requests.get",
-            side_effect=ConnectionError("timeout"),
-        ):
+        get_patch, resp = _mock_get("")
+        resp.raise_for_status.side_effect = ConnectionError("timeout")
+        with get_patch:
             result = scraper_node({"job_url": "https://bad.url"})
         assert "error" in result
         assert "parsed_job" not in result
 
     def test_llm_failure_returns_raw_text_and_error(self):
         from backend.llm import LLMError
-        with self._mock_get():
-            with patch(
-                "backend.agents.scraper.llm_json",
-                side_effect=LLMError("no keys"),
-            ):
-                result = scraper_node({"job_url": "https://example.com/job"})
+        get_patch, _ = _mock_get(self._HTML)
+        with get_patch, patch("backend.agents.scraper.llm_json", side_effect=LLMError("no keys")):
+            result = scraper_node({"job_url": "https://example.com/job"})
         assert "error" in result
-        assert "raw_job_text" in result  # raw text preserved even on LLM failure
+        assert "raw_job_text" in result
 
     def test_normalises_missing_fields(self):
-        minimal = {"title": None, "company": None}
-        with self._mock_get():
-            with patch("backend.agents.scraper.llm_json", return_value=minimal):
-                result = scraper_node({"job_url": "https://example.com/job"})
+        get_patch, _ = _mock_get(self._HTML)
+        with get_patch, patch("backend.agents.scraper.llm_json", return_value={"title": None, "company": None}):
+            result = scraper_node({"job_url": "https://example.com/job"})
         assert result["parsed_job"]["title"] == "Unknown"
         assert result["parsed_job"]["required_skills"] == []
+
+    def test_blocked_domain_returns_error(self):
+        result = scraper_node({"job_url": "https://www.linkedin.com/jobs/view/123"})
+        assert "error" in result
+        assert "linkedin" in result["error"].lower()
 
 
 class TestFetchPageText:
@@ -141,22 +143,18 @@ class TestFetchPageText:
             "<html><head><style>body{}</style></head>"
             "<body><nav>nav</nav><p>real content</p><footer>footer</footer></body></html>"
         )
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.text = html
-        with patch("backend.agents.scraper.requests.get", return_value=resp):
-            text = fetch_page_text("https://x")
+        get_patch, _ = _mock_get(html)
+        with get_patch:
+            text = fetch_page_text("https://example.com/job")
         assert "real content" in text
         assert "nav" not in text
         assert "footer" not in text
 
     def test_result_capped_at_12000_chars(self):
         long_html = "<p>" + "x " * 10000 + "</p>"
-        resp = MagicMock()
-        resp.raise_for_status = MagicMock()
-        resp.text = long_html
-        with patch("backend.agents.scraper.requests.get", return_value=resp):
-            text = fetch_page_text("https://x")
+        get_patch, _ = _mock_get(long_html)
+        with get_patch:
+            text = fetch_page_text("https://example.com/job")
         assert len(text) <= 12000
 
 

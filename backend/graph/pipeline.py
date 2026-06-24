@@ -1,7 +1,10 @@
 """LangGraph state machine wiring the five agents into a pipeline.
 
 Single-application flow:
-    scraper -> analysis -> tailor -> cover_letter -> tracker -> END
+    scraper -> analysis -> tailor -> writer -> tracker -> END
+
+Note: the cover-letter node is registered as "writer" (not "cover_letter") because
+LangGraph forbids using a state key name as a node name.
 
 Each node returns a partial state dict that LangGraph merges. Nodes short-circuit
 their own work when ``state["error"]`` is set, but the tracker still runs so a
@@ -44,14 +47,14 @@ def build_graph():
     graph.add_node("scraper", scraper_node)
     graph.add_node("analysis", analysis_node)
     graph.add_node("tailor", tailor_node)
-    graph.add_node("cover_letter", cover_letter_node)
+    graph.add_node("writer", cover_letter_node)
     graph.add_node("tracker", tracker_node)
 
     graph.add_edge(START, "scraper")
     graph.add_edge("scraper", "analysis")
     graph.add_edge("analysis", "tailor")
-    graph.add_edge("tailor", "cover_letter")
-    graph.add_edge("cover_letter", "tracker")
+    graph.add_edge("tailor", "writer")
+    graph.add_edge("writer", "tracker")
     graph.add_edge("tracker", END)
 
     return graph.compile()
@@ -68,6 +71,47 @@ def get_graph():
     if _APP_GRAPH is None:
         _APP_GRAPH = build_graph()
     return _APP_GRAPH
+
+
+def run_from_text(job_url: str, raw_jd_text: str, resume_text: str) -> ApplicationState:
+    """Run the pipeline from pasted job description text, skipping the scraper."""
+    from ..agents.scraper import _EXTRACT_SYSTEM, _EXTRACT_USER_TMPL
+    from ..agents import analysis_node, tailor_node, cover_letter_node, tracker_node
+    from ..llm import llm_json, LLMError
+
+    try:
+        parsed = llm_json(
+            _EXTRACT_SYSTEM,
+            _EXTRACT_USER_TMPL.format(text=raw_jd_text[:12000]),
+            temperature=0.1,
+        )
+        parsed = {
+            "title": parsed.get("title") or "Unknown",
+            "company": parsed.get("company") or "Unknown",
+            "required_skills": parsed.get("required_skills") or [],
+            "responsibilities": parsed.get("responsibilities") or [],
+            "nice_to_haves": parsed.get("nice_to_haves") or [],
+            "salary": parsed.get("salary"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("JD extraction failed, using empty parsed_job: %s", exc)
+        parsed = {
+            "title": "Unknown", "company": "Unknown",
+            "required_skills": [], "responsibilities": [], "nice_to_haves": [], "salary": None,
+        }
+
+    state: ApplicationState = {
+        "job_url": job_url or "pasted",
+        "resume_text": resume_text,
+        "raw_job_text": raw_jd_text,
+        "parsed_job": parsed,
+        "status": "To Apply",
+    }
+    state.update(analysis_node(state))
+    state.update(tailor_node(state))
+    state.update(cover_letter_node(state))
+    state.update(tracker_node(state))
+    return state
 
 
 def run_single(job_url: str, resume_text: str) -> ApplicationState:

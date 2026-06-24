@@ -113,10 +113,27 @@ with t1:
     st.markdown("**Matching skills:** " + ", ".join(selected.get("matching_skills") or []))
     st.markdown("**Missing skills:** " + ", ".join(selected.get("missing_skills") or []))
 with t2:
-    for b in selected.get("tailored_bullets") or []:
-        st.markdown(f"- ~~{b.get('original','')}~~")
-        st.markdown(f"  → **{b.get('rewritten','')}**")
-        st.caption(b.get("rationale", ""))
+    bullets = selected.get("tailored_bullets") or []
+    if not bullets:
+        st.write("No tailored bullets.")
+    for i, b in enumerate(bullets, 1):
+        st.markdown(f"**Bullet {i}** — *{b.get('rationale','')}*")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Original**")
+            st.markdown(
+                f'<div style="padding:.4rem .7rem;background:#fafafa;border:1px solid #e0e0e0;'
+                f'border-radius:5px;font-size:.91rem;">{b.get("original","")}</div>',
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown("**Rewritten**")
+            st.markdown(
+                f'<div style="padding:.4rem .7rem;background:#f6fff6;border:1px solid #c8e6c9;'
+                f'border-radius:5px;font-size:.91rem;">{b.get("rewritten","")}</div>',
+                unsafe_allow_html=True,
+            )
+        st.write("")
 with t3:
     st.text_area(
         "Cover letter", value=selected.get("cover_letter", ""), height=400, disabled=True

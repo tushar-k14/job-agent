@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,6 +18,14 @@ def fresh_db(tmp_path):
     # Windows SQLite lock: let pytest's tmp_path handle cleanup.
 
 
+def _make_get_patch():
+    """Patch requests.get used inside fetch_page_text."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.text = "<html><body><p>Software Engineer at Corp. Python required.</p></body></html>"
+    return patch("backend.agents.scraper.requests.get", return_value=resp), resp
+
+
 def _mock_full_pipeline(
     *,
     parsed_job=None,
@@ -26,27 +33,17 @@ def _mock_full_pipeline(
     bullets=None,
     cover_letter="Dear Hiring Team,\n...",
 ):
-    """Context manager that stubs all five agent nodes."""
+    """Return tuple of context managers that stub all five agent nodes."""
     parsed_job = parsed_job or {
         "title": "SWE", "company": "Corp",
         "required_skills": ["Python"], "responsibilities": ["code"],
         "nice_to_haves": [], "salary": None,
     }
     bullets = bullets or [{"original": "a", "rewritten": "b", "rationale": "r"}]
-
-    scraper_out = {"raw_job_text": "...", "parsed_job": parsed_job}
-    analysis_out = {
-        "match_score": match_score,
-        "matching_skills": ["Python"],
-        "missing_skills": [],
-        "transferable_experiences": [],
-    }
-    tailor_out = {"tailored_bullets": bullets}
-    cover_out = {"cover_letter": cover_letter}
-    # tracker runs against real DB (not mocked)
+    get_patch, _ = _make_get_patch()
 
     return (
-        patch("backend.agents.scraper.requests.get", return_value=_html_resp()),
+        get_patch,
         patch("backend.agents.scraper.llm_json", return_value=parsed_job),
         patch("backend.agents.analysis.llm_json", return_value={
             "match_score": match_score,
@@ -59,13 +56,6 @@ def _mock_full_pipeline(
     )
 
 
-def _html_resp():
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock()
-    resp.text = "<html><body><p>Software Engineer at Corp. Python required.</p></body></html>"
-    return resp
-
-
 class TestBuildGraph:
     def test_graph_compiles(self):
         from backend.graph import build_graph
@@ -76,7 +66,7 @@ class TestBuildGraph:
         from backend.graph import build_graph
         g = build_graph()
         node_names = set(g.nodes)
-        for expected in ("scraper", "analysis", "tailor", "cover_letter", "tracker"):
+        for expected in ("scraper", "analysis", "tailor", "writer", "tracker"):
             assert expected in node_names, f"Missing node: {expected}"
 
 
@@ -93,13 +83,18 @@ class TestRunSingle:
         assert isinstance(state.get("application_id"), int)
 
     def test_error_in_scraper_propagates_gracefully(self):
-        with patch(
-            "backend.agents.scraper.requests.get",
-            side_effect=ConnectionError("network error"),
-        ):
+        get_patch, resp = _make_get_patch()
+        resp.raise_for_status.side_effect = ConnectionError("network error")
+        with get_patch:
             from backend.graph import run_single
             state = run_single("https://bad.url", "resume")
         # Pipeline should complete (tracker still runs); error field is set
+        assert state.get("error")
+        assert "application_id" in state
+
+    def test_blocked_domain_returns_error_with_id(self):
+        from backend.graph import run_single
+        state = run_single("https://www.linkedin.com/jobs/view/123", "resume")
         assert state.get("error")
         assert "application_id" in state
 
@@ -153,19 +148,17 @@ class TestRunBatch:
                 on_complete=lambda done, total, s: calls.append((done, total)),
             )
         assert len(calls) == 2
-        totals = {t for _, t in calls}
-        assert totals == {2}
+        assert {t for _, t in calls} == {2}
 
     def test_one_failure_does_not_abort_others(self):
-        good_resp = _html_resp()
-        call_count = 0
-
         def get_side_effect(url, **kwargs):
-            nonlocal call_count
-            call_count += 1
+            r = MagicMock()
+            r.text = "<html><body><p>job</p></body></html>"
             if "bad" in url:
-                raise ConnectionError("bad url")
-            return good_resp
+                r.raise_for_status.side_effect = ConnectionError("bad url")
+            else:
+                r.raise_for_status = MagicMock()
+            return r
 
         patches = _mock_full_pipeline()
         with patch("backend.agents.scraper.requests.get", side_effect=get_side_effect):
@@ -183,7 +176,6 @@ class TestRunBatch:
         assert len(successes) == 1
 
     def test_results_preserve_input_order(self):
-        """Batch results must come back in the same order as input URLs."""
         urls = [f"https://job{i}.com" for i in range(5)]
         patches = _mock_full_pipeline()
         with patches[0], patches[1], patches[2], patches[3], patches[4]:

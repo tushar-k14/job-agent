@@ -20,8 +20,26 @@ logger = logging.getLogger(__name__)
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
+
+# Sites known to block headless scraping — surface a clear error rather than a 403/404
+_BLOCKED_DOMAINS = {
+    "linkedin.com",
+    "indeed.com",
+    "glassdoor.com",
+    "ziprecruiter.com",
 }
 
 _MAX_CHARS = 12000  # keep the prompt bounded
@@ -51,8 +69,21 @@ JOB POSTING TEXT:
 \"\"\""""
 
 
+def _check_blocked_domain(url: str) -> None:
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.lower().lstrip("www.")
+    for domain in _BLOCKED_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            raise ValueError(
+                f"{domain} blocks automated scraping. Use the company's own careers "
+                f"page URL, or paste the job description text into a pastebin service "
+                f"and use that URL instead."
+            )
+
+
 def fetch_page_text(url: str) -> str:
     """Download a URL and return cleaned, visible text."""
+    _check_blocked_domain(url)
     resp = requests.get(url, headers=_HEADERS, timeout=30)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")

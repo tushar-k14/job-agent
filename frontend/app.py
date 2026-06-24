@@ -22,6 +22,7 @@ except Exception:  # noqa: BLE001
 
 from backend.db import init_db  # noqa: E402
 from backend.graph import run_batch, run_single  # noqa: E402
+from backend.graph.pipeline import run_from_text  # noqa: E402
 from frontend.diff_utils import render_word_diff  # noqa: E402
 
 st.set_page_config(page_title="Job Application Agent", page_icon="🤖", layout="wide")
@@ -86,74 +87,127 @@ def render_match_gauge(score: int) -> None:
     )
 
 
-def render_results(state: dict) -> None:
-    if state.get("error"):
-        st.error(state["error"])
+def _as_list(value) -> list:
+    """Coerce a state field to a plain list regardless of LangGraph wrapper type."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    return list(value)
 
-    parsed = state.get("parsed_job") or {}
+
+def _as_dict(value) -> dict:
+    """Coerce a state field to a plain dict."""
+    if not value:
+        return {}
+    return dict(value)
+
+
+def render_results(state: dict) -> None:
+    # Normalise: LangGraph returns AddableValuesDict; convert to plain dict once.
+    state = dict(state)
+
+    if state.get("error"):
+        st.error(f"Pipeline error: {state['error']}")
+        # If we have no job data at all, stop here — nothing useful to show.
+        if not state.get("parsed_job"):
+            st.info(
+                "**Tip:** Many job boards (LinkedIn, Indeed, Greenhouse) block automated "
+                "scraping. Try:\n"
+                "- Pasting the **direct job description URL** (not the listing page)\n"
+                "- Using a company careers page URL instead of an aggregator\n"
+                "- Copying the job text manually into a pastebin and pasting that URL"
+            )
+            return
+
+    parsed = _as_dict(state.get("parsed_job"))
     tabs = st.tabs(
         ["📋 Job Analysis", "🎯 Match Score", "✍️ Tailored Resume", "📨 Cover Letter"]
     )
 
     # --- Job Analysis ---
     with tabs[0]:
-        st.subheader(parsed.get("title", "Unknown role"))
-        st.caption(f"**{parsed.get('company', 'Unknown company')}**")
+        title = parsed.get("title") or "Unknown role"
+        company = parsed.get("company") or "Unknown company"
+        st.subheader(title)
+        st.caption(f"**{company}**")
         if parsed.get("salary"):
             st.info(f"💰 Salary: {parsed['salary']}")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Required skills**")
-            for s in parsed.get("required_skills", []) or ["—"]:
-                st.markdown(f"- {s}")
-            st.markdown("**Nice to have**")
-            for s in parsed.get("nice_to_haves", []) or ["—"]:
-                st.markdown(f"- {s}")
-        with c2:
-            st.markdown("**Responsibilities**")
-            for s in parsed.get("responsibilities", []) or ["—"]:
-                st.markdown(f"- {s}")
+
+        required = _as_list(parsed.get("required_skills"))
+        nice = _as_list(parsed.get("nice_to_haves"))
+        responsibilities = _as_list(parsed.get("responsibilities"))
+
+        if not required and not nice and not responsibilities:
+            st.warning("No structured job data extracted — check the raw page or try another URL.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Required skills**")
+                for s in required or ["—"]:
+                    st.markdown(f"- {s}")
+                st.markdown("**Nice to have**")
+                for s in nice or ["—"]:
+                    st.markdown(f"- {s}")
+            with c2:
+                st.markdown("**Responsibilities**")
+                for s in responsibilities or ["—"]:
+                    st.markdown(f"- {s}")
 
     # --- Match Score ---
     with tabs[1]:
-        render_match_gauge(int(state.get("match_score", 0)))
+        render_match_gauge(int(state.get("match_score") or 0))
         c1, c2, c3 = st.columns(3)
         with c1:
             st.markdown("**✅ Matching skills**")
-            for s in state.get("matching_skills", []) or ["—"]:
+            matching = _as_list(state.get("matching_skills"))
+            for s in matching or ["—"]:
                 st.markdown(f"- {s}")
         with c2:
             st.markdown("**⚠️ Missing skills**")
-            for s in state.get("missing_skills", []) or ["—"]:
+            missing = _as_list(state.get("missing_skills"))
+            for s in missing or ["—"]:
                 st.markdown(f"- {s}")
         with c3:
             st.markdown("**🔄 Transferable**")
-            for s in state.get("transferable_experiences", []) or ["—"]:
+            transferable = _as_list(state.get("transferable_experiences"))
+            for s in transferable or ["—"]:
                 st.markdown(f"- {s}")
 
     # --- Tailored Resume (diff view) ---
     with tabs[2]:
-        bullets = state.get("tailored_bullets") or []
+        bullets = _as_list(state.get("tailored_bullets"))
         if not bullets:
             st.write("No tailored bullets were produced.")
         for i, b in enumerate(bullets, 1):
-            st.markdown(f"**Bullet {i}**")
-            st.markdown(
-                f'<div style="padding:.5rem;border:1px solid #ddd;border-radius:6px;">'
-                f"{render_word_diff(b.get('original',''), b.get('rewritten',''))}</div>",
-                unsafe_allow_html=True,
-            )
-            with st.expander("Original / rewritten / why"):
-                st.markdown(f"**Original:** {b.get('original','')}")
-                st.markdown(f"**Rewritten:** {b.get('rewritten','')}")
-                st.caption(b.get("rationale", ""))
+            b = dict(b)
+            original = b.get("original", "")
+            rewritten = b.get("rewritten", "")
+            rationale = b.get("rationale", "")
+            st.markdown(f"**Bullet {i}** — *{rationale}*")
+            col_orig, col_new = st.columns(2)
+            with col_orig:
+                st.markdown("**Original**")
+                st.markdown(
+                    f'<div style="padding:.5rem .75rem;background:#fafafa;border:1px solid #e0e0e0;'
+                    f'border-radius:6px;font-size:.92rem;">{original}</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_new:
+                st.markdown("**Rewritten**")
+                diff_html = render_word_diff(original, rewritten)
+                st.markdown(
+                    f'<div style="padding:.5rem .75rem;background:#f6fff6;border:1px solid #c8e6c9;'
+                    f'border-radius:6px;font-size:.92rem;">{diff_html}</div>',
+                    unsafe_allow_html=True,
+                )
             st.write("")
 
-    # --- Cover Letter (editable + copy) ---
+    # --- Cover Letter (editable + download) ---
     with tabs[3]:
         letter = st.text_area(
             "Cover letter (editable)",
-            value=state.get("cover_letter", ""),
+            value=state.get("cover_letter") or "",
             height=420,
             key=f"cover_{state.get('application_id', 'tmp')}",
         )
@@ -162,9 +216,8 @@ def render_results(state: dict) -> None:
             data=letter,
             file_name="cover_letter.txt",
             mime="text/plain",
+            key=f"dl_{state.get('application_id', 'tmp')}",
         )
-        st.code(letter, language=None)
-        st.caption("Use the copy icon on the box above to copy the letter.")
 
 
 # --------------------------------------------------------------------------- #
@@ -179,12 +232,45 @@ def main() -> None:
     mode = st.radio("Mode", ["Single job", "Batch (multiple URLs)"], horizontal=True)
 
     if mode == "Single job":
-        url = st.text_input("Job posting URL", placeholder="https://...")
-        if st.button("🚀 Process", type="primary", disabled=not (url and resume)):
+        input_mode = st.radio(
+            "Job input method",
+            ["URL (company careers page)", "Paste job description text"],
+            horizontal=True,
+            help="LinkedIn/Indeed/Glassdoor block scraping. Use a direct company careers URL or paste the JD text.",
+        )
+
+        url = ""
+        raw_jd_text = ""
+
+        if input_mode == "URL (company careers page)":
+            url = st.text_input(
+                "Job posting URL",
+                placeholder="https://company.com/careers/job-id  (avoid LinkedIn/Indeed)",
+            )
+            st.caption("Works best with direct company careers pages (Greenhouse, Lever, Workday, etc.)")
+        else:
+            raw_jd_text = st.text_area(
+                "Paste the full job description here",
+                height=260,
+                placeholder="Copy and paste the full job description text from any job posting...",
+            )
+            url = st.text_input(
+                "Job URL (optional — for tracking only)",
+                placeholder="https://...",
+            )
+
+        can_process = resume and (url or raw_jd_text)
+        if st.button("🚀 Process", type="primary", disabled=not can_process):
             with st.spinner("Running the agent pipeline..."):
-                state = run_single(url, resume)
+                if raw_jd_text.strip():
+                    state = run_from_text(url, raw_jd_text, resume)
+                else:
+                    state = run_single(url, resume)
             st.session_state["last_result"] = state
-            st.success(f"Done — saved as application #{state.get('application_id')}.")
+            if state.get("error") and not state.get("parsed_job"):
+                st.error(f"Failed: {state['error']}")
+            else:
+                st.success(f"Done — saved as application #{state.get('application_id')}.")
 
         if st.session_state.get("last_result"):
             st.divider()
