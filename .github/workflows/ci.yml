@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Run agent benchmark (mock tier, gated)
+        # Mock tier: deterministic, no API keys, no cost. Fails the build if the agent's
+        # structural pass rate drops below the threshold.
+        run: |
+          python -m eval.run_benchmark --threshold 0.95 --json benchmark_result.json
+
+      - name: Upload benchmark result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-result
+          path: benchmark_result.json

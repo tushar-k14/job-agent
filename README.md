@@ -12,33 +12,67 @@ LLM calls use **DeepSeek** as the primary provider with an automatic fallback to
 
 ## Architecture
 
-A LangGraph state machine threads a single `ApplicationState` through five agent nodes:
+A LangGraph state machine built as an explicit **planner → executor → verifier** loop
+with two capped retry gates. Every hand-off between nodes is a validated **Pydantic**
+model (`backend/schemas.py`), not loose dict parsing.
 
 ```
-job_url ─▶ ┌───────────────┐   ┌──────────────────┐   ┌──────────────────┐   ┌─────────────────┐   ┌──────────────┐
-           │ JobScraper    │──▶│ ResumeAnalysis   │──▶│ ResumeTailior    │──▶│ CoverLetter     │──▶│ Tracker      │──▶ SQLite
-           │ (requests +   │   │ (match score,    │   │ (truthful bullet │   │ (3-paragraph    │   │ (persist +   │
-           │  BeautifulSoup│   │  gaps, transfers)│   │  reframing)      │   │  letter)        │   │  set status) │
-           │  + LLM extract)│  └──────────────────┘   └──────────────────┘   └─────────────────┘   └──────────────┘
-           └───────────────┘
+START → planner → executor → scrape_verifier ──pass──▶ analysis → tailor → writer → cover_letter_verifier ──pass──▶ tracker → END
+            ▲                       │ fail                                                      │ fail
+            └───── retry (≤3) ──────┘  (escalate extraction strategy)        regenerate (≤3) ──┘  (with corrective feedback)
 ```
 
 | Node | Responsibility |
 |------|----------------|
-| **JobScraperAgent** | Fetches the URL, strips boilerplate, LLM-extracts title, company, required skills, responsibilities, nice-to-haves, salary |
-| **ResumeAnalysisAgent** | Compares resume ↔ job → matching skills, missing skills, transferable experiences, **match score 0–100** |
-| **ResumeTailiorAgent** | Rewrites existing bullets to fit the job — **reframes only, never invents** experience |
-| **CoverLetterAgent** | Writes a 3-paragraph letter: *why the role*, *why the company*, *why you* |
-| **TrackerAgent** | Saves the full package to SQLite and stamps a status |
+| **planner** | Chooses the extraction **strategy** for this attempt (and escalates it on retry); flags thin JDs for enrichment. Queries persistent memory for a strategy known to work on the target domain. *Deterministic — no LLM.* |
+| **executor** | Runs the chosen strategy (fetches HTML **once**, caches across retries); supports paste-text and enrichment actions. |
+| **scrape_verifier** | **Deterministic** gate: title/company/description present, not a captcha/error page → routes back to planner with the failure reason. |
+| **analysis** | resume ↔ job → matching/missing/transferable skills, **match score 0–100**. |
+| **tailor** | Rewrites existing bullets to fit the job — **reframes only, never invents**. |
+| **writer** | 3-paragraph cover letter: *why the role / company / you*. Consumes verifier feedback on retry. |
+| **cover_letter_verifier** | **LLM-as-judge** for subtle fabrication + length + filler, backed by a **deterministic entity-grounding** pre-check (every named entity in the letter must trace to the resume or job). |
+| **tracker** | Persists the full package to SQLite, stamps status, and **writes the run outcome to vector memory**. |
 
-`ApplicationState` (see [`backend/graph/state.py`](backend/graph/state.py)) carries:
-`job_url, raw_job_text, parsed_job, resume_text, match_score, tailored_bullets,
-cover_letter, application_id, status` (+ analysis fields and an `error` channel).
+**Extraction strategies** (`backend/agents/strategies.py`): `selector_structured`
+(known ATS containers) → `generic_text` (boilerplate-stripped visible text) →
+`llm_from_raw_html` (raw markup to the LLM), plus `paste_text` for pasted JDs. The
+planner walks this escalation order across retries.
+
+**Persistent vector memory** (`backend/memory/`, Chroma, in-process): records each run's
+`{domain, strategy, success, reason, scores}`. The planner recalls the
+highest-success-rate strategy per domain before acting. Defaults to a no-op embedding
+(zero model download); set `JOB_AGENT_MEMORY_EMBED=1` for semantic embeddings.
+
+`ApplicationState` (see [`backend/graph/state.py`](backend/graph/state.py)) threads the
+job/resume inputs, parsed job, analysis fields, tailored bullets, cover letter, the
+planner decision + verifier verdicts, retry counters, and an `error` channel.
 
 ### Batch mode (map-reduce)
 Multiple URLs (one per line) are fanned out across a thread pool — each URL runs its
 own isolated copy of the graph concurrently — then reduced into a list, with a live
 Streamlit progress bar. See [`run_batch`](backend/graph/pipeline.py).
+
+## Benchmark
+
+A fixed suite of **24 tasks** with explicit, automated pass/fail criteria exercises the
+agent's *structural correctness*: correct strategy selection & escalation, scrape-verifier
+verdicts, capped retries, enrichment decisions, blocked-domain handling, and deterministic
+cover-letter grounding (no fabrication). Two tiers:
+
+- **Mock tier** (`python -m eval.run_benchmark`) — deterministic, no API keys, no cost.
+  Gates CI on every push; the build fails if the pass rate drops below the threshold.
+- **Live tier** (`--live`) — runs the real DeepSeek/Gemini pipeline for true quality
+  measurement, on demand.
+
+```
+$ python -m eval.run_benchmark --threshold 0.95
+  tier=mock  tasks=24  passed=24
+  PASS RATE : 100.0%
+  avg latency: ~135 ms/task
+```
+
+**Current benchmark (mock tier): 24/24 = 100% pass rate.** Runs in CI via
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ---
 
@@ -48,15 +82,22 @@ Streamlit progress bar. See [`run_batch`](backend/graph/pipeline.py).
 job-agent/
 ├── backend/
 │   ├── llm/            # DeepSeek primary + Gemini fallback client
-│   ├── agents/         # the 5 agent nodes
-│   ├── graph/          # ApplicationState + compiled LangGraph + batch runner
+│   ├── agents/         # planner, executor, verifier, analysis, tailor,
+│   │                   #   cover_letter, tracker + strategies
+│   ├── graph/          # ApplicationState + compiled P/E/V LangGraph + batch runner
+│   ├── schemas.py      # Pydantic models for typed node hand-offs
+│   ├── memory/         # Chroma persistent vector memory (site quirks + outcomes)
+│   ├── guardrails/     # deterministic cover-letter entity-grounding check
 │   └── db/             # SQLite persistence
+├── eval/               # benchmark suite: fixtures, harness, scoring, run_benchmark.py
 ├── frontend/
 │   ├── app.py          # main page: process single / batch, result tabs
 │   ├── diff_utils.py   # word-level diff highlighting
 │   └── pages/
 │       └── 1_Applications_Dashboard.py
-├── data/               # SQLite DB lives here (gitignored, volume-mounted)
+├── docs/               # current_architecture.md
+├── .github/workflows/  # CI: tests + gated benchmark
+├── data/               # SQLite DB + Chroma memory (gitignored, volume-mounted)
 ├── run_cli.py          # headless runner for testing
 ├── Dockerfile
 ├── docker-compose.yml
