@@ -1,7 +1,13 @@
 # Current Architecture (Phase 0 baseline)
 
+> **Note:** This is the *historical Phase 0 baseline* captured before the refactor. All
+> five phases of the refactor plan (§5) are now implemented — see the top-level
+> [`README.md`](../README.md) for the current planner/executor/verifier architecture,
+> Chroma memory, benchmark, and observability. This file is kept as the record of where
+> the project started and why each change was made.
+
 _Snapshot taken before the planner/executor/verifier refactor. This describes what
-exists **today**, honestly, including what is missing for production use._
+existed at the start, honestly, including what was missing for production use._
 
 ## 1. What this system actually is
 

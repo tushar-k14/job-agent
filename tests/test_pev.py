@@ -198,7 +198,9 @@ class TestRouters:
         state = {"cover_letter_verdict": {"passed": False}, "cover_letter_attempts": 1}
         assert _route_after_cover_letter(state) == "writer"
 
-    def test_cover_fail_exhausted_routes_to_tracker(self):
+    def test_cover_fail_exhausted_routes_to_fallback(self):
+        # Phase 4: exhausted retries route to the deterministic grounded-template fallback
+        # rather than shipping an unverified letter straight to the tracker.
         state = {"cover_letter_verdict": {"passed": False},
                  "cover_letter_attempts": MAX_COVER_LETTER_ATTEMPTS}
-        assert _route_after_cover_letter(state) == "tracker"
+        assert _route_after_cover_letter(state) == "cover_letter_fallback"

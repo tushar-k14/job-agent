@@ -108,6 +108,7 @@ class Expect:
     max_scrape_attempts: int = 3
     cover_letter_grounded: Optional[bool] = None  # deterministic grounding check
     is_blocked_domain: bool = False
+    cover_letter_fallback: Optional[bool] = None  # deterministic fallback engaged?
 
 
 @dataclass
@@ -315,7 +316,10 @@ def all_tasks() -> list[BenchmarkTask]:
         judge=dict(_JUDGE_FAIL),
         expect=Expect(
             scrape_passed=True, has_error=False,
-            cover_letter_grounded=False,  # the key assertion
+            # Phase 4: fabrication is not just detected but REMEDIATED — retries exhaust,
+            # the deterministic fallback engages, and the FINAL letter is grounded.
+            cover_letter_fallback=True,
+            cover_letter_grounded=True,
         ),
     ))
     tasks.append(BenchmarkTask(
@@ -374,7 +378,8 @@ def all_tasks() -> list[BenchmarkTask]:
         expect=Expect(
             scrape_passed=True, has_error=False,
             final_strategy="paste_text",
-            cover_letter_grounded=False,
+            cover_letter_fallback=True,
+            cover_letter_grounded=True,
         ),
     ))
 

@@ -205,6 +205,16 @@ def render_results(state: dict) -> None:
 
     # --- Cover Letter (editable + download) ---
     with tabs[3]:
+        if state.get("cover_letter_fallback_used"):
+            st.warning(
+                "⚠️ The AI drafts failed the fabrication/quality check on every retry, so "
+                "a **grounded template letter** (built only from verified resume facts) was "
+                "used. Consider editing it to add detail."
+            )
+        cl_verdict = state.get("cover_letter_verdict") or {}
+        if cl_verdict and not state.get("cover_letter_fallback_used"):
+            if cl_verdict.get("passed"):
+                st.caption(f"✅ Passed quality check: {cl_verdict.get('reason', '')}")
         letter = st.text_area(
             "Cover letter (editable)",
             value=state.get("cover_letter") or "",

@@ -56,6 +56,8 @@ class ApplicationState(TypedDict, total=False):
     # Most recent verifier verdicts (dicts of VerificationResult), for tracing/dashboard.
     scrape_verdict: dict
     cover_letter_verdict: dict
+    # True when the deterministic grounded-template fallback replaced the LLM letter.
+    cover_letter_fallback_used: bool
     # Strategy actually used for the successful (or final) extraction.
     strategy_used: str
     # Fetched HTML cached across retries so we re-parse instead of re-downloading.

@@ -50,7 +50,7 @@ def _route_after_scrape(state: ApplicationState) -> str:
 
 
 def _route_after_cover_letter(state: ApplicationState) -> str:
-    """After cover-letter verification: continue, regenerate, or accept and move on."""
+    """After cover-letter verification: continue, regenerate, or fall back deterministically."""
     from ..agents.verifier import MAX_COVER_LETTER_ATTEMPTS
 
     verdict = state.get("cover_letter_verdict") or {}
@@ -58,7 +58,51 @@ def _route_after_cover_letter(state: ApplicationState) -> str:
         return "tracker"
     if state.get("cover_letter_attempts", 0) < MAX_COVER_LETTER_ATTEMPTS:
         return "writer"  # regenerate with corrective feedback
-    return "tracker"  # exhausted retries — record best effort with the verdict attached
+    # Retries exhausted and still failing → deterministic grounded-template fallback
+    # rather than shipping an unverified (possibly fabricated) letter.
+    return "cover_letter_fallback"
+
+
+def _traced(name: str, fn):
+    """Wrap a node fn so each invocation is captured as a trace step."""
+    from ..observability import trace_step
+
+    def wrapper(state: ApplicationState) -> dict:
+        with trace_step(name, input_summary=_summarize_input(name, state)) as st:
+            result = fn(state)
+            st.output_summary = _summarize_output(name, result)
+            return result
+
+    wrapper.__name__ = getattr(fn, "__name__", name)
+    return wrapper
+
+
+def _summarize_input(name: str, state: ApplicationState) -> str:
+    if name in ("planner", "executor"):
+        return f"url={state.get('job_url', '')[:60]} attempt={state.get('scrape_attempts', 0)}"
+    if name == "scrape_verifier":
+        pj = state.get("parsed_job") or {}
+        return f"title={pj.get('title')} company={pj.get('company')}"
+    if name in ("writer", "cover_letter_verifier"):
+        return f"cl_attempt={state.get('cover_letter_attempts', 0)}"
+    return ""
+
+
+def _summarize_output(name: str, result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    if "plan" in result:
+        p = result["plan"]
+        return f"strategy={p.get('strategy')} enrich={p.get('needs_enrichment')}"
+    if "scrape_verdict" in result:
+        return f"scrape_passed={result['scrape_verdict'].get('passed')}"
+    if "cover_letter_verdict" in result:
+        return f"cl_passed={result['cover_letter_verdict'].get('passed')}"
+    if "match_score" in result:
+        return f"match_score={result.get('match_score')}"
+    if result.get("error"):
+        return f"error={result['error'][:60]}"
+    return ", ".join(k for k in result if k != "cached_html")[:80]
 
 
 def build_graph():
@@ -72,18 +116,23 @@ def build_graph():
     )
     from ..agents.planner import planner_node
     from ..agents.executor import executor_node
-    from ..agents.verifier import scrape_verifier_node, cover_letter_verifier_node
+    from ..agents.verifier import (
+        scrape_verifier_node,
+        cover_letter_verifier_node,
+        cover_letter_fallback_node,
+    )
 
     g = StateGraph(ApplicationState)
 
-    g.add_node("planner", planner_node)
-    g.add_node("executor", executor_node)
-    g.add_node("scrape_verifier", scrape_verifier_node)
-    g.add_node("analysis", analysis_node)
-    g.add_node("tailor", tailor_node)
-    g.add_node("writer", cover_letter_node)
-    g.add_node("cover_letter_verifier", cover_letter_verifier_node)
-    g.add_node("tracker", tracker_node)
+    g.add_node("planner", _traced("planner", planner_node))
+    g.add_node("executor", _traced("executor", executor_node))
+    g.add_node("scrape_verifier", _traced("scrape_verifier", scrape_verifier_node))
+    g.add_node("analysis", _traced("analysis", analysis_node))
+    g.add_node("tailor", _traced("tailor", tailor_node))
+    g.add_node("writer", _traced("writer", cover_letter_node))
+    g.add_node("cover_letter_verifier", _traced("cover_letter_verifier", cover_letter_verifier_node))
+    g.add_node("cover_letter_fallback", _traced("cover_letter_fallback", cover_letter_fallback_node))
+    g.add_node("tracker", _traced("tracker", tracker_node))
 
     g.add_edge(START, "planner")
     g.add_edge("planner", "executor")
@@ -99,8 +148,13 @@ def build_graph():
     g.add_conditional_edges(
         "cover_letter_verifier",
         _route_after_cover_letter,
-        {"writer": "writer", "tracker": "tracker"},
+        {
+            "writer": "writer",
+            "cover_letter_fallback": "cover_letter_fallback",
+            "tracker": "tracker",
+        },
     )
+    g.add_edge("cover_letter_fallback", "tracker")
     g.add_edge("tracker", END)
 
     return g.compile()
@@ -116,6 +170,24 @@ def get_graph():
     return _APP_GRAPH
 
 
+def _invoke_traced(initial: ApplicationState) -> ApplicationState:
+    """Invoke the graph inside a run trace and persist the trace alongside the result."""
+    from ..observability import start_run
+
+    with start_run(job_url=initial.get("job_url", "")) as run:
+        result = get_graph().invoke(initial)
+        # Persist the structured trace if we recorded an application id.
+        try:
+            from ..db import save_run_trace
+
+            app_id = result.get("application_id")
+            if app_id:
+                save_run_trace(app_id, run.to_dict())
+        except Exception:  # noqa: BLE001 - never fail the run over trace persistence
+            pass
+    return result
+
+
 def run_single(job_url: str, resume_text: str) -> ApplicationState:
     """Run the full pipeline for one job URL and return the final state."""
     initial: ApplicationState = {
@@ -124,7 +196,7 @@ def run_single(job_url: str, resume_text: str) -> ApplicationState:
         "status": "To Apply",
         "pasted": False,
     }
-    return get_graph().invoke(initial)
+    return _invoke_traced(initial)
 
 
 def run_from_text(job_url: str, raw_jd_text: str, resume_text: str) -> ApplicationState:
@@ -140,7 +212,7 @@ def run_from_text(job_url: str, raw_jd_text: str, resume_text: str) -> Applicati
         "status": "To Apply",
         "pasted": True,
     }
-    return get_graph().invoke(initial)
+    return _invoke_traced(initial)
 
 
 def run_batch(

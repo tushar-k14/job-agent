@@ -32,6 +32,8 @@ _STOPWORDS = {
     "This", "That", "These", "Those", "It", "We", "Our", "Your", "You", "Their",
     "Manager", "Sir", "Madam", "Thank", "Thanks", "Yours", "Faithfully", "Role",
     "Company", "Position", "Engineer", "Developer", "Senior", "Junior", "Lead",
+    "Please", "Find", "What", "Why", "How", "When", "Where", "Who", "Confident",
+    "Writing", "Experience", "Opportunity", "Background", "Qualifications",
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
     "January", "February", "March", "April", "May", "June", "July", "August",
     "September", "October", "November", "December",

@@ -162,6 +162,30 @@ def cover_letter_verifier_node(state: ApplicationState) -> dict:
         )
         return {"cover_letter_verdict": verdict.model_dump(mode="json")}
 
+    # Defense-in-depth gate 1 (deterministic, free): entity grounding. If the letter
+    # asserts entities not traceable to resume/job, fail immediately without spending an
+    # LLM judge call — this catches blatant fabrication for zero cost.
+    try:
+        from ..guardrails import check_cover_letter_grounding
+
+        grounding = check_cover_letter_grounding(
+            state.get("cover_letter", ""),
+            state.get("resume_text", ""),
+            state.get("parsed_job") or {},
+        )
+        if not grounding.grounded:
+            verdict = VerificationResult(
+                stage=VerificationStage.COVER_LETTER,
+                passed=False,
+                reason=grounding.reason,
+                fabrication_detected=True,
+            )
+            logger.info("Cover-letter grounding gate failed: %s", grounding.reason)
+            return {"cover_letter_verdict": verdict.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Grounding pre-check skipped: %s", exc)
+
+    # Gate 2 (LLM-as-judge): catches subtler issues grounding can't (tone, length, filler).
     try:
         judgement = _judge_cover_letter(state)
     except Exception as exc:  # noqa: BLE001
@@ -187,3 +211,22 @@ def cover_letter_verifier_node(state: ApplicationState) -> dict:
         verdict.passed, verdict.fabrication_detected, verdict.reason,
     )
     return {"cover_letter_verdict": verdict.model_dump(mode="json")}
+
+
+def cover_letter_fallback_node(state: ApplicationState) -> dict:
+    """Deterministic fallback: when the LLM letter fails verification on every retry,
+    replace it with a grounded template letter that cannot fabricate."""
+    from ..guardrails.fallback import grounded_fallback_letter
+
+    letter = grounded_fallback_letter(dict(state))
+    logger.info("Cover-letter fallback engaged (template letter from grounded facts).")
+    verdict = VerificationResult(
+        stage=VerificationStage.COVER_LETTER,
+        passed=True,
+        reason="Deterministic grounded-template fallback after retries exhausted.",
+    )
+    return {
+        "cover_letter": letter,
+        "cover_letter_verdict": verdict.model_dump(mode="json"),
+        "cover_letter_fallback_used": True,
+    }

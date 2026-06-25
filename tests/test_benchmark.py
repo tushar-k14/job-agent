@@ -103,11 +103,13 @@ class TestHarness:
         assert score_task(task, out["state"]) == []
         assert out["state"].get("error")
 
-    def test_fabrication_task_caught_by_grounding(self):
+    def test_fabrication_task_remediated_by_fallback(self):
         task = next(t for t in all_tasks() if t.id == "fabrication_detected")
         out = run_task(task)
-        # Scoring expects cover_letter_grounded=False and that must hold.
+        # Phase 4: fabrication detected -> retries exhaust -> deterministic fallback ->
+        # final letter is grounded. Scoring must pass and the fallback flag must be set.
         assert score_task(task, out["state"]) == []
+        assert out["state"]["cover_letter_fallback_used"] is True
 
     def test_harness_reports_tokens(self):
         task = next(t for t in all_tasks() if t.id == "good_main")

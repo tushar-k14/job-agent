@@ -50,6 +50,12 @@ def score_task(task: BenchmarkTask, state: dict) -> list[str]:
         if "scrap" not in err and "block" not in err:
             failures.append(f"blocked domain: error doesn't indicate blocking ({state.get('error')})")
 
+    # deterministic fallback engaged?
+    if exp.cover_letter_fallback is not None:
+        used = bool(state.get("cover_letter_fallback_used"))
+        if used != exp.cover_letter_fallback:
+            failures.append(f"cover_letter_fallback: expected {exp.cover_letter_fallback}, got {used}")
+
     # deterministic grounding check on the produced cover letter
     if exp.cover_letter_grounded is not None:
         letter = state.get("cover_letter", "")

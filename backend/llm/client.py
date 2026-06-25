@@ -39,6 +39,16 @@ class LLMError(RuntimeError):
     """Raised when every configured provider fails."""
 
 
+def _record_usage(prompt_tokens: int, completion_tokens: int) -> None:
+    """Attribute token usage to the active trace step, if tracing is active."""
+    try:
+        from ..observability import record_llm_usage
+
+        record_llm_usage(prompt_tokens, completion_tokens)
+    except Exception:  # noqa: BLE001 - tracing must never break the call
+        pass
+
+
 def _deepseek_complete(
     system: str,
     user: str,
@@ -50,26 +60,33 @@ def _deepseek_complete(
     if not api_key:
         raise LLMError("DEEPSEEK_API_KEY is not set")
 
-    resp = requests.post(
-        f"{DEEPSEEK_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": DEEPSEEK_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        },
-        timeout=DEFAULT_TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    from ..guardrails.retry import with_backoff
+
+    def _call():
+        resp = requests.post(
+            f"{DEEPSEEK_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DEEPSEEK_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            },
+            timeout=DEFAULT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    data = with_backoff(_call)
+    usage = data.get("usage") or {}
+    _record_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
     return data["choices"][0]["message"]["content"]
 
 
@@ -84,22 +101,30 @@ def _gemini_complete(
     if not api_key:
         raise LLMError("GEMINI_API_KEY is not set")
 
+    from ..guardrails.retry import with_backoff
+
     url = f"{GEMINI_BASE_URL}/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    resp = requests.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json={
-            "system_instruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
+
+    def _call():
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_tokens,
+                },
             },
-        },
-        timeout=DEFAULT_TIMEOUT,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+            timeout=DEFAULT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    data = with_backoff(_call)
+    usage = data.get("usageMetadata") or {}
+    _record_usage(usage.get("promptTokenCount", 0), usage.get("candidatesTokenCount", 0))
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError) as exc:  # pragma: no cover - defensive

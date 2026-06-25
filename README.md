@@ -47,6 +47,24 @@ highest-success-rate strategy per domain before acting. Defaults to a no-op embe
 job/resume inputs, parsed job, analysis fields, tailored bullets, cover letter, the
 planner decision + verifier verdicts, retry counters, and an `error` channel.
 
+### Observability & guardrails
+- **Tracing** (`backend/observability/`): every step is captured as a structured trace
+  (input/output summary, LLM calls, **real token usage**, latency) via **structlog** JSON
+  logs, and each run is persisted to SQLite (`run_traces`). Set `LANGSMITH_API_KEY` to
+  additionally stream native LangGraph traces to LangSmith — no code change needed.
+- **Real token capture**: the LLM client parses the `usage` field from DeepSeek/Gemini
+  responses and attributes prompt/completion tokens to the active step → real cost on the
+  dashboard.
+- **Retry with backoff** (`backend/guardrails/retry.py`): provider calls retry on
+  *transient* errors only (timeouts, 429/5xx) with exponential backoff + jitter;
+  deterministic failures (bad key, 4xx) fail fast.
+- **Deterministic fabrication gate** (`backend/guardrails/grounding.py`): runs *before*
+  the LLM judge — every named entity in a cover letter must trace to the resume/job, or
+  it's rejected for free.
+- **Deterministic fallback** (`backend/guardrails/fallback.py`): when the cover letter
+  fails verification on every retry, a **grounded template letter** (built only from
+  verified resume facts) replaces it rather than shipping something fabricated.
+
 ### Batch mode (map-reduce)
 Multiple URLs (one per line) are fanned out across a thread pool — each URL runs its
 own isolated copy of the graph concurrently — then reduced into a list, with a live
@@ -87,14 +105,16 @@ job-agent/
 │   ├── graph/          # ApplicationState + compiled P/E/V LangGraph + batch runner
 │   ├── schemas.py      # Pydantic models for typed node hand-offs
 │   ├── memory/         # Chroma persistent vector memory (site quirks + outcomes)
-│   ├── guardrails/     # deterministic cover-letter entity-grounding check
-│   └── db/             # SQLite persistence
+│   ├── guardrails/     # grounding check, retry/backoff, deterministic fallback
+│   ├── observability/  # structlog tracing + per-step token/latency capture
+│   └── db/             # SQLite persistence (applications + run_traces)
 ├── eval/               # benchmark suite: fixtures, harness, scoring, run_benchmark.py
 ├── frontend/
 │   ├── app.py          # main page: process single / batch, result tabs
 │   ├── diff_utils.py   # word-level diff highlighting
 │   └── pages/
-│       └── 1_Applications_Dashboard.py
+│       ├── 1_Applications_Dashboard.py
+│       └── 2_Observability.py   # runs, pass rate over time, cost per run
 ├── docs/               # current_architecture.md
 ├── .github/workflows/  # CI: tests + gated benchmark
 ├── data/               # SQLite DB + Chroma memory (gitignored, volume-mounted)

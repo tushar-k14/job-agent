@@ -37,6 +37,25 @@ CREATE TABLE IF NOT EXISTS applications (
 );
 """
 
+# Observability: one row per pipeline run, linked to an application.
+_TRACE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_traces (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id  INTEGER,
+    run_id          TEXT,
+    success         INTEGER,
+    scrape_passed   INTEGER,
+    cover_passed    INTEGER,
+    strategy_used   TEXT,
+    scrape_attempts INTEGER,
+    latency_ms      REAL,
+    total_tokens    INTEGER,
+    total_llm_calls INTEGER,
+    trace_json      TEXT,
+    created_at      TEXT
+);
+"""
+
 
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -48,6 +67,7 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(_SCHEMA)
+        conn.execute(_TRACE_SCHEMA)
         conn.commit()
 
 
@@ -154,3 +174,71 @@ def update_cover_letter(app_id: int, cover_letter: str) -> None:
             (cover_letter, _now(), app_id),
         )
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Observability: run traces
+# --------------------------------------------------------------------------- #
+def save_run_trace(application_id: int, trace: dict) -> int:
+    """Persist a structured run trace (dict from RunTrace.to_dict)."""
+    init_db()
+    steps = trace.get("steps") or []
+    # Derive a couple of headline booleans from the step outputs for fast dashboard queries.
+    scrape_passed = any(
+        "scrape_passed=True" in (s.get("output") or "") for s in steps
+    )
+    cover_passed = any(
+        "cl_passed=True" in (s.get("output") or "") for s in steps
+    )
+    strategy_used = ""
+    scrape_attempts = 0
+    for s in steps:
+        out = s.get("output") or ""
+        if s.get("name") == "executor":
+            scrape_attempts += 1
+        if "strategy=" in out and s.get("name") == "planner":
+            strategy_used = out.split("strategy=")[1].split(" ")[0]
+    success = scrape_passed and not any(s.get("error") for s in steps)
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO run_traces (
+                application_id, run_id, success, scrape_passed, cover_passed,
+                strategy_used, scrape_attempts, latency_ms, total_tokens,
+                total_llm_calls, trace_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                application_id,
+                trace.get("run_id", ""),
+                int(success),
+                int(scrape_passed),
+                int(cover_passed),
+                strategy_used,
+                scrape_attempts,
+                float(trace.get("latency_ms", 0.0)),
+                int(trace.get("total_tokens", 0)),
+                int(trace.get("total_llm_calls", 0)),
+                _dumps(trace),
+                _now(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_run_traces(limit: int = 100) -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM run_traces ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["trace"] = json.loads(d.pop("trace_json")) if d.get("trace_json") else None
+        except (TypeError, json.JSONDecodeError):
+            d["trace"] = None
+        out.append(d)
+    return out
