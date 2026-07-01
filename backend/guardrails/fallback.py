@@ -32,10 +32,12 @@ def build_template_cover_letter(
         if skills
         else "the relevant experience on my resume"
     )
+    # Transferable items from the analysis agent are descriptive SENTENCES (e.g.
+    # "Automated reporting shows scripting ability"), not noun phrases — so we render
+    # them as their own standalone sentences rather than embedding them in a clause,
+    # which would produce broken grammar.
     transfer_clause = (
-        f" I also bring {_oxford(transferable)}, which transfers directly to this work."
-        if transferable
-        else ""
+        " " + " ".join(_as_sentence(t) for t in transferable[:2]) if transferable else ""
     )
 
     return (
@@ -48,6 +50,14 @@ def build_template_cover_letter(
         f"you for your consideration.\n\n"
         f"Sincerely,"
     )
+
+
+def _as_sentence(text: str) -> str:
+    """Normalize a fragment into a clean standalone sentence (capitalized, one period)."""
+    t = text.strip().rstrip(".")
+    if not t:
+        return ""
+    return t[0].upper() + t[1:] + "."
 
 
 def _oxford(items: list[str]) -> str:

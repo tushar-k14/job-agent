@@ -98,6 +98,19 @@ class TestFallback:
         assert "Dear Hiring Team" in letter
         assert "Sincerely" in letter
 
+    def test_sentence_form_transferable_not_mangled(self):
+        # Regression (live-found): transferable items are full sentences from the analysis
+        # agent; embedding them as a noun phrase produced "I also bring <sentence>, which
+        # transfers..." garbage. They must render as clean standalone sentences.
+        from backend.guardrails.fallback import build_template_cover_letter
+        letter = build_template_cover_letter(
+            title="Senior Backend Engineer", company="CloudScale Inc",
+            matching_skills=[],
+            transferable=["Automated Excel reports with Python shows some scripting ability"],
+        )
+        assert "bring Automated" not in letter  # the mangled pattern
+        assert "Automated Excel reports with Python shows some scripting ability." in letter
+
     def test_oxford_comma(self):
         from backend.guardrails.fallback import build_template_cover_letter
         letter = build_template_cover_letter(
