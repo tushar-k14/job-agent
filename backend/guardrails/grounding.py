@@ -55,6 +55,18 @@ _TECH_VOCAB = {
     "git", "github", "gitlab", "linux", "kubernetes", "prometheus", "grafana",
 }
 
+# Generic technical vocabulary that is NOT a fabricatable entity. Saying "API design"
+# or "REST endpoints" asserts no specific unverifiable experience the way naming a
+# company (Google) or a specific tool the candidate lacks (Kubernetes) would. Excluding
+# these avoids false-positive fabrication flags on ordinary engineering prose.
+_GENERIC_TECH = {
+    "api", "apis", "rest", "restful", "sql", "nosql", "http", "https", "json", "xml",
+    "html", "css", "ci", "cd", "cicd", "sdk", "cli", "ui", "ux", "orm", "crud", "mvc",
+    "tcp", "udp", "ip", "dns", "ssl", "tls", "url", "uri", "saas", "paas", "iaas",
+    "etl", "ml", "ai", "llm", "nlp", "db", "ide", "os", "vm", "vpc", "cdn", "qa",
+    "oop", "tdd", "bdd", "pr", "prs", "mvp", "poc", "kpi", "sla", "b2b", "b2c",
+}
+
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9.+#-]*")
 _CAP_TOKEN_RE = re.compile(r"\b([A-Z][A-Za-z0-9.+#&-]{1,})\b")
 
@@ -63,22 +75,55 @@ def _normalize(tok: str) -> str:
     return tok.lower().strip(".,;:!?()[]\"'")
 
 
+def _singularize(tok: str) -> str:
+    """Cheap plural→singular: 'apis'→'api', 'schemas'→'schema'. Guards short tokens."""
+    if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+        return tok[:-1]
+    return tok
+
+
+def _is_sentence_initial(text: str, start: int) -> bool:
+    """True if the token at ``start`` is the first word of a sentence (so its capital is
+    grammatical, not a proper-noun signal). Looks back past whitespace for a sentence
+    boundary (start-of-text, newline, or . ! ? : ; " ( ‑ )."""
+    i = start - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    if i < 0:
+        return True
+    return text[i] in ".!?:;\n\r\"'([—–-•*"
+
+
 def extract_candidate_entities(text: str) -> set[str]:
-    """Salient entities a letter might assert: capitalized tokens + known tech terms."""
+    """Salient entities a letter might assert: mid-sentence proper nouns + known tech terms.
+
+    Two rules keep this high-precision (few false positives, so it doesn't wrongly trip
+    the fallback):
+    - A capitalized word is an entity candidate only if it appears MID-sentence — a
+      sentence-initial capital ("Ensuring…", "With…") is grammar, not an entity.
+    - Generic technical vocabulary (API, REST, SQL, …) is never an entity — you can't
+      "fabricate" saying "API design".
+    The LLM-as-judge gate remains the backstop for subtler cases this misses.
+    """
     entities: set[str] = set()
 
-    # Capitalized tokens (companies, proper nouns) minus grammar stopwords.
     for m in _CAP_TOKEN_RE.finditer(text):
         tok = m.group(1)
         if tok in _STOPWORDS:
             continue
+        if _is_sentence_initial(text, m.start()):
+            continue
         norm = _normalize(tok)
+        if norm in _GENERIC_TECH or _singularize(norm) in _GENERIC_TECH:
+            continue
         if len(norm) >= 2:
             entities.add(norm)
 
-    # Known technologies regardless of case.
+    # Known specific technologies regardless of case/position (kubernetes, pytorch, …).
     for m in _TOKEN_RE.finditer(text):
         norm = _normalize(m.group(0))
+        if norm in _GENERIC_TECH:  # generic vocab is never a fabricatable entity
+            continue
         if norm in _TECH_VOCAB:
             entities.add(norm)
 
@@ -86,14 +131,22 @@ def extract_candidate_entities(text: str) -> set[str]:
 
 
 def _source_vocabulary(sources: Iterable[str]) -> set[str]:
-    """All tokens (normalized) that appear anywhere in the allowed source material."""
+    """All tokens in the source material, stored in both surface and singular form so
+    plural/singular differences ('APIs' in resume vs 'API' in letter) still match."""
     vocab: set[str] = set()
     for src in sources:
         if not src:
             continue
         for m in _TOKEN_RE.finditer(src):
-            vocab.add(_normalize(m.group(0)))
+            norm = _normalize(m.group(0))
+            vocab.add(norm)
+            vocab.add(_singularize(norm))
     return vocab
+
+
+def _is_grounded(entity: str, source_vocab: set[str]) -> bool:
+    """Entity is grounded if it (or its singular form) appears in source."""
+    return entity in source_vocab or _singularize(entity) in source_vocab
 
 
 @dataclass
@@ -137,7 +190,7 @@ def check_cover_letter_grounding(
     source_vocab = _source_vocabulary([resume_text, *job_strings, *extra_allowed])
 
     entities = extract_candidate_entities(cover_letter)
-    ungrounded = sorted(e for e in entities if e not in source_vocab)
+    ungrounded = sorted(e for e in entities if not _is_grounded(e, source_vocab))
 
     return GroundingResult(
         grounded=not ungrounded,

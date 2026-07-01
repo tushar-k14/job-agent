@@ -65,6 +65,40 @@ class TestGrounding:
         ents = extract_candidate_entities("i used python and kubernetes daily")
         assert "python" in ents and "kubernetes" in ents
 
+    # --- Regressions from live testing: these false-positives forced every real
+    #     cover letter to the template fallback before the fix. ---
+    def test_plural_singular_api_grounded(self):
+        # Resume says "REST APIs" (plural); letter says "API design" (singular).
+        r = check_cover_letter_grounding(
+            "Dear Team, I focus on API design and delivery. Sincerely,",
+            self._RESUME, self._JOB,
+        )
+        assert r.grounded is True, r.ungrounded_entities
+
+    def test_sentence_initial_capital_ignored(self):
+        # "Ensuring"/"Deploying"/"With" start sentences — capitalized for grammar only.
+        letter = (
+            "Dear Hiring Team, I built systems with Python.\n"
+            "Ensuring quality was my focus. Deploying with Docker was routine.\n"
+            "With FastAPI I shipped features. Sincerely,"
+        )
+        r = check_cover_letter_grounding(letter, self._RESUME, self._JOB)
+        assert r.grounded is True, r.ungrounded_entities
+
+    def test_generic_acronyms_not_entities(self):
+        ents = extract_candidate_entities("I designed REST APIs, SQL queries, and CI/CD pipelines.")
+        for generic in ("api", "apis", "rest", "sql", "ci", "cd"):
+            assert generic not in ents, f"{generic} should not be an entity"
+
+    def test_midsentence_proper_noun_still_caught(self):
+        # A fabricated company mid-sentence must still be flagged.
+        r = check_cover_letter_grounding(
+            "Dear Team, I previously worked at Netflix on their platform. Sincerely,",
+            self._RESUME, self._JOB,
+        )
+        assert r.grounded is False
+        assert "netflix" in r.ungrounded_entities
+
 
 # --------------------------------------------------------------------------- #
 # Harness + scoring
