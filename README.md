@@ -195,6 +195,13 @@ docker build -t job-application-agent .
 docker run -p 8501:8501 --env-file .env -v "$(pwd)/data:/app/data" job-application-agent
 ```
 
+### AWS free tier (EC2)
+Full step-by-step in **[deploy/DEPLOY_AWS.md](deploy/DEPLOY_AWS.md)**. TL;DR: launch a
+free-tier `t3.micro`, open port 8501, then run the one-shot
+[`deploy/bootstrap.sh`](deploy/bootstrap.sh) (adds swap, installs Docker, clones, starts
+compose). On a 1 GB instance use `requirements-cloud.txt` (drops Chroma; memory degrades
+to a no-op, everything else works).
+
 ### Notes for production
 - Put the app behind a reverse proxy (nginx/Caddy) with TLS if exposing publicly.
 - The DB is single-file SQLite — fine for personal use; swap the `backend/db` layer for

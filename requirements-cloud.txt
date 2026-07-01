@@ -1,0 +1,15 @@
+# Lightweight requirements for small cloud instances (e.g. AWS EC2 t3.micro, 1 GB RAM).
+# Identical to requirements.txt but WITHOUT chromadb/onnxruntime, which are heavy to
+# install/run on a 1 GB box. The app degrades gracefully: persistent vector memory
+# becomes a no-op (planner falls back to its default strategy escalation), everything
+# else — the P/E/V graph, guardrails, tracing, dashboard — works unchanged.
+#
+# Use full requirements.txt if your instance has >= 2 GB RAM and you want memory on.
+streamlit>=1.36,<2.0
+langgraph>=0.2,<0.3
+pydantic>=2.6,<3.0
+structlog>=24.1
+requests>=2.31
+beautifulsoup4>=4.12
+pandas>=2.0
+python-dotenv>=1.0
